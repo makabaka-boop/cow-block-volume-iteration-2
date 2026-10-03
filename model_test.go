@@ -517,10 +517,10 @@ func TestHTTPSparseAndRangeRead(t *testing.T) {
 	// Zero-byte writes are not mutations: they neither extend a file nor bump
 	// the revision. One past EOF is still a stable range error.
 	fileLen := int64(len(m.files["h"].data))
-	if nr, st := c.write("h", fileLen, nil, 1); st != http.StatusOK || nr != 1 {
+	if nr, st := c.write("h", fileLen, nil, m.revision); st != http.StatusOK || nr != m.revision {
 		t.Fatalf("zero write at EOF: status=%d rev=%d", st, nr)
 	}
-	if _, st := c.write("h", fileLen+1, nil, 1); st != http.StatusRequestedRangeNotSatisfiable {
+	if _, st := c.write("h", fileLen+1, nil, m.revision); st != http.StatusRequestedRangeNotSatisfiable {
 		t.Fatalf("zero write past EOF status=%d", st)
 	}
 
@@ -530,10 +530,10 @@ func TestHTTPSparseAndRangeRead(t *testing.T) {
 	if st != http.StatusRequestedRangeNotSatisfiable {
 		t.Fatalf("overflowing read status=%d", st)
 	}
-	if hrev != "1" {
-		t.Fatalf("range error X-Revision=%q, want 1", hrev)
+	if hrev != strconv.FormatInt(m.revision, 10) {
+		t.Fatalf("range error X-Revision=%q, want %d", hrev, m.revision)
 	}
-	if _, st, hrev := c.read("h", fileLen+1, -1); st != http.StatusRequestedRangeNotSatisfiable || hrev != "1" {
+	if _, st, hrev := c.read("h", fileLen+1, -1); st != http.StatusRequestedRangeNotSatisfiable || hrev != strconv.FormatInt(m.revision, 10) {
 		t.Fatalf("past EOF read status=%d X-Revision=%q", st, hrev)
 	}
 

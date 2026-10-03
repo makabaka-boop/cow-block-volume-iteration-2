@@ -12,6 +12,10 @@ import (
 // maxWriteBytes caps a single overwrite request body.
 const maxWriteBytes = 64 << 20 // 64 MiB
 
+// maxBatchBytes caps an encoded JSON batch, including base64 expansion of up
+// to eight maximum-sized write payloads.
+const maxBatchBytes = MaxBatchSteps*(maxWriteBytes*4/3+64) + (1 << 20)
+
 // Server exposes a Volume over HTTP.
 type Server struct {
 	Vol *Volume
@@ -36,6 +40,7 @@ func NewServer(vol *Volume) *Server {
 //	POST /write?name=...&offset=N        body: bytes to overwrite
 //	POST /truncate?name=...&length=N
 //	POST /delete?name=...
+//	POST /batch                 body: {"steps":[...]}
 //	GET  /read?name=...&offset=N[&length=N]   (no length => to EOF)
 //	GET  /stat?name=...
 //	GET  /stats
@@ -46,6 +51,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/write", s.handleWrite)
 	mux.HandleFunc("/truncate", s.handleTruncate)
 	mux.HandleFunc("/delete", s.handleDelete)
+	mux.HandleFunc("/batch", s.handleBatch)
 	mux.HandleFunc("/read", s.handleRead)
 	mux.HandleFunc("/stat", s.handleStat)
 	mux.HandleFunc("/stats", s.handleStats)
@@ -58,6 +64,11 @@ type mutationResponse struct {
 
 type errorResponse struct {
 	Error string `json:"error"`
+	Step  int    `json:"step,omitempty"`
+}
+
+type batchRequest struct {
+	Steps []BatchStep `json:"steps"`
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -73,7 +84,7 @@ func writeError(w http.ResponseWriter, status int, err error) {
 // statusFor maps domain errors to HTTP status codes.
 func statusFor(err error) int {
 	switch {
-	case errors.Is(err, ErrInvalidName):
+	case errors.Is(err, ErrInvalidName), errors.Is(err, ErrInvalidBatch):
 		return http.StatusBadRequest
 	case errors.Is(err, ErrExists):
 		return http.StatusConflict // distinct from a revision conflict
@@ -227,6 +238,45 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	newRev, err := s.Vol.Delete(r.URL.Query().Get("name"), rev)
 	if err != nil {
+		writeError(w, statusFor(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, mutationResponse{Revision: newRev})
+}
+
+func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	rev, err := expectedRevision(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBatchBytes)
+	var req batchRequest
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		if strings.Contains(err.Error(), "request body too large") {
+			writeError(w, http.StatusRequestEntityTooLarge, err)
+			return
+		}
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if dec.More() {
+		writeError(w, http.StatusBadRequest, errors.New("unexpected trailing JSON value"))
+		return
+	}
+	newRev, err := s.Vol.Batch(req.Steps, rev)
+	if err != nil {
+		var be *BatchError
+		if errors.As(err, &be) {
+			writeJSON(w, statusFor(be.Err), errorResponse{Error: err.Error(), Step: be.Step})
+			return
+		}
 		writeError(w, statusFor(err), err)
 		return
 	}
