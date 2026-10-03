@@ -8,6 +8,14 @@
 // revision can commit; the others fail with ErrConflict without changing any
 // state. Every mutation either commits completely or leaves the volume
 // untouched.
+//
+// Batch bundles up to MaxBatchSteps create/clone/write/truncate/delete steps
+// into one atomic operation: the steps run in order against a private staging
+// copy of the volume, each observing the staged effects of the previous ones.
+// The batch carries a single expected revision; on success the staged state
+// is published as a whole and the revision advances exactly once. Any step
+// failure leaves the committed volume — including the free block pool —
+// exactly as it was and reports the failing step's index.
 package vfs
 
 import (
@@ -41,6 +49,9 @@ var (
 	// ErrQuota is returned when an operation cannot reserve enough free
 	// physical blocks. Nothing is mutated in that case.
 	ErrQuota = errors.New("vfs: out of physical blocks")
+	// ErrInvalidBatch is returned when a batch is empty, carries more than
+	// MaxBatchSteps steps or names an unknown operation.
+	ErrInvalidBatch = errors.New("vfs: invalid batch")
 )
 
 // file is a single logical file. blocks maps a logical block index to the ID
@@ -189,12 +200,21 @@ func (v *Volume) Create(name string, expected int64) (newRev int64, err error) {
 	if expected != v.revision {
 		return v.revision, ErrConflict
 	}
-	if _, ok := v.files[name]; ok {
-		return v.revision, ErrExists
+	if err := v.createLocked(name); err != nil {
+		return v.revision, err
 	}
-	v.files[name] = &file{name: name, blocks: make(map[int64]int)}
 	v.revision++
 	return v.revision, nil
+}
+
+// createLocked is Create without the revision check or bump; the caller holds
+// the lock (or works on a private staging copy).
+func (v *Volume) createLocked(name string) error {
+	if _, ok := v.files[name]; ok {
+		return ErrExists
+	}
+	v.files[name] = &file{name: name, blocks: make(map[int64]int)}
+	return nil
 }
 
 // Clone creates dst as an instant copy of src. The logical block table is
@@ -209,12 +229,21 @@ func (v *Volume) Clone(src, dst string, expected int64) (newRev int64, err error
 	if expected != v.revision {
 		return v.revision, ErrConflict
 	}
+	if err := v.cloneLocked(src, dst); err != nil {
+		return v.revision, err
+	}
+	v.revision++
+	return v.revision, nil
+}
+
+// cloneLocked is Clone without the revision check or bump.
+func (v *Volume) cloneLocked(src, dst string) error {
 	s, ok := v.files[src]
 	if !ok {
-		return v.revision, ErrNotFound
+		return ErrNotFound
 	}
 	if _, ok := v.files[dst]; ok {
-		return v.revision, ErrExists
+		return ErrExists
 	}
 	nf := &file{name: dst, length: s.length, blocks: make(map[int64]int, len(s.blocks))}
 	for idx, id := range s.blocks {
@@ -222,8 +251,7 @@ func (v *Volume) Clone(src, dst string, expected int64) (newRev int64, err error
 		v.blocks[id].refs++
 	}
 	v.files[dst] = nf
-	v.revision++
-	return v.revision, nil
+	return nil
 }
 
 // Write overwrites len(data) bytes at offset, growing the file and creating
@@ -249,15 +277,28 @@ func (v *Volume) Write(name string, offset int64, data []byte, expected int64) (
 	if expected != v.revision {
 		return v.revision, ErrConflict
 	}
+	mutated, err := v.writeLocked(name, offset, data)
+	if err != nil {
+		return v.revision, err
+	}
+	if mutated {
+		v.revision++
+	}
+	return v.revision, nil
+}
+
+// writeLocked is Write without the revision check or bump. It reports whether
+// the volume was mutated: a zero-length write at or before EOF is a no-op.
+func (v *Volume) writeLocked(name string, offset int64, data []byte) (mutated bool, err error) {
 	f, ok := v.files[name]
 	if !ok {
-		return v.revision, ErrNotFound
+		return false, ErrNotFound
 	}
 	if len(data) == 0 {
 		if offset > f.length {
-			return v.revision, ErrOutOfRange
+			return false, ErrOutOfRange
 		}
-		return v.revision, nil
+		return false, nil
 	}
 
 	end := offset + int64(len(data))
@@ -265,18 +306,16 @@ func (v *Volume) Write(name string, offset int64, data []byte, expected int64) (
 	// Reservation phase: count every block we must allocate (holes and
 	// shared blocks that need copy-on-write).
 	need := 0
-	if len(data) > 0 {
-		first := offset / BlockSize
-		last := (end - 1) / BlockSize
-		for idx := first; idx <= last; idx++ {
-			id, present := f.blocks[idx]
-			if !present || v.blocks[id].refs > 1 {
-				need++
-			}
+	first := offset / BlockSize
+	last := (end - 1) / BlockSize
+	for idx := first; idx <= last; idx++ {
+		id, present := f.blocks[idx]
+		if !present || v.blocks[id].refs > 1 {
+			need++
 		}
 	}
 	if len(v.blocks)+need > MaxBlocks {
-		return v.revision, ErrQuota
+		return false, ErrQuota
 	}
 
 	// Commit phase: every remaining step is infallible.
@@ -293,8 +332,7 @@ func (v *Volume) Write(name string, offset int64, data []byte, expected int64) (
 	if end > f.length {
 		f.length = end
 	}
-	v.revision++
-	return v.revision, nil
+	return true, nil
 }
 
 // Truncate sets the logical length. Shrinking drops blocks fully past the new
@@ -314,17 +352,25 @@ func (v *Volume) Truncate(name string, length int64, expected int64) (newRev int
 	if expected != v.revision {
 		return v.revision, ErrConflict
 	}
+	if err := v.truncateLocked(name, length); err != nil {
+		return v.revision, err
+	}
+	v.revision++
+	return v.revision, nil
+}
+
+// truncateLocked is Truncate without the revision check or bump.
+func (v *Volume) truncateLocked(name string, length int64) error {
 	f, ok := v.files[name]
 	if !ok {
-		return v.revision, ErrNotFound
+		return ErrNotFound
 	}
 
 	if length >= f.length {
 		// Growth: no physical work. Bytes between the old partial tail and
 		// any future write remain logical zeros / holes.
 		f.length = length
-		v.revision++
-		return v.revision, nil
+		return nil
 	}
 
 	// Shrink. Classify mapped slots without mutating anything.
@@ -361,7 +407,7 @@ func (v *Volume) Truncate(name string, length int64, expected int64) (newRev int
 		}
 	}
 	if straddleNeedsAlloc && len(v.blocks)-reclaim+1 > MaxBlocks {
-		return v.revision, ErrQuota
+		return ErrQuota
 	}
 
 	// Commit phase.
@@ -385,8 +431,7 @@ func (v *Volume) Truncate(name string, length int64, expected int64) (newRev int
 		}
 	}
 	f.length = length
-	v.revision++
-	return v.revision, nil
+	return nil
 }
 
 // Delete removes a file and drops all its block references; physical blocks
@@ -400,16 +445,182 @@ func (v *Volume) Delete(name string, expected int64) (newRev int64, err error) {
 	if expected != v.revision {
 		return v.revision, ErrConflict
 	}
+	if err := v.deleteLocked(name); err != nil {
+		return v.revision, err
+	}
+	v.revision++
+	return v.revision, nil
+}
+
+// deleteLocked is Delete without the revision check or bump.
+func (v *Volume) deleteLocked(name string) error {
 	f, ok := v.files[name]
 	if !ok {
-		return v.revision, ErrNotFound
+		return ErrNotFound
 	}
 	for _, id := range f.blocks {
 		v.decLocked(id)
 	}
 	delete(v.files, name)
+	return nil
+}
+
+// MaxBatchSteps is the maximum number of steps a single Batch may carry.
+const MaxBatchSteps = 8
+
+// Op identifies the operation a batch Step performs. The names match the
+// single-step HTTP endpoints.
+type Op string
+
+const (
+	OpCreate   Op = "create"
+	OpClone    Op = "clone"
+	OpWrite    Op = "write"
+	OpTruncate Op = "truncate"
+	OpDelete   Op = "delete"
+)
+
+// Step is one operation inside an atomic Batch. It reuses the names, offsets
+// and range rules of the matching single-step operation:
+//
+//	OpCreate:   Name
+//	OpClone:    Src -> Dst
+//	OpWrite:    Name, Offset, Data (empty Data is the zero-length write no-op)
+//	OpTruncate: Name, Length
+//	OpDelete:   Name
+type Step struct {
+	Op     Op     `json:"op"`
+	Name   string `json:"name,omitempty"`
+	Src    string `json:"src,omitempty"`
+	Dst    string `json:"dst,omitempty"`
+	Offset int64  `json:"offset,omitempty"`
+	Length int64  `json:"length,omitempty"`
+	Data   []byte `json:"data,omitempty"`
+}
+
+// validateStatic checks everything the corresponding single-step operation
+// checks before looking at volume state: name legality, offset/length range
+// and overflow. An unknown operation is an invalid batch.
+func (s Step) validateStatic() error {
+	switch s.Op {
+	case OpCreate, OpDelete:
+		if !ValidateName(s.Name) {
+			return ErrInvalidName
+		}
+	case OpClone:
+		if !ValidateName(s.Src) || !ValidateName(s.Dst) {
+			return ErrInvalidName
+		}
+	case OpWrite:
+		if !ValidateName(s.Name) {
+			return ErrInvalidName
+		}
+		if s.Offset < 0 {
+			return ErrOutOfRange
+		}
+		if len(s.Data) > 0 && s.Offset > int64Max-int64(len(s.Data)) {
+			return ErrOutOfRange
+		}
+	case OpTruncate:
+		if !ValidateName(s.Name) {
+			return ErrInvalidName
+		}
+		if s.Length < 0 {
+			return ErrOutOfRange
+		}
+	default:
+		return ErrInvalidBatch
+	}
+	return nil
+}
+
+// applyLocked runs one validated step against the (staging) volume.
+func (v *Volume) applyLocked(s Step) error {
+	switch s.Op {
+	case OpCreate:
+		return v.createLocked(s.Name)
+	case OpClone:
+		return v.cloneLocked(s.Src, s.Dst)
+	case OpWrite:
+		_, err := v.writeLocked(s.Name, s.Offset, s.Data)
+		return err
+	case OpTruncate:
+		return v.truncateLocked(s.Name, s.Length)
+	case OpDelete:
+		return v.deleteLocked(s.Name)
+	default:
+		return ErrInvalidBatch // unreachable: validateStatic ran first
+	}
+}
+
+// snapshotLocked deep-copies the committed state: every file's block map,
+// every physical block including its data, and the free list. Batch stages
+// its steps on the snapshot, so a failed batch leaves the real volume — and
+// its free block pool — bit-for-bit untouched.
+func (v *Volume) snapshotLocked() *Volume {
+	s := &Volume{
+		blocks:   make(map[int]*pblock, len(v.blocks)),
+		files:    make(map[string]*file, len(v.files)),
+		freelist: append([]int(nil), v.freelist...),
+		revision: v.revision,
+	}
+	for id, b := range v.blocks {
+		data := make([]byte, BlockSize)
+		copy(data, b.data)
+		s.blocks[id] = &pblock{data: data, refs: b.refs}
+	}
+	for name, f := range v.files {
+		blocks := make(map[int64]int, len(f.blocks))
+		for idx, id := range f.blocks {
+			blocks[idx] = id
+		}
+		s.files[name] = &file{name: name, length: f.length, blocks: blocks}
+	}
+	return s
+}
+
+// Batch applies steps as one atomic operation and advances the revision
+// exactly once. The batch carries a single expected revision for the whole
+// sequence. Steps run in the given order on a private staging copy of the
+// committed state: every step is checked against the staged file set,
+// copy-on-write sharing and physical-block quota as they stand after the
+// previous steps, so a later step may reference a file an earlier step
+// created (or re-create one an earlier step deleted), and blocks freed by an
+// earlier step are available to later ones.
+//
+// On success the staged file mappings, block contents, reference counts and
+// statistics are published as a whole — concurrent readers only ever observe
+// the complete pre- or post-commit state — and Batch returns the new
+// revision with failedStep == -1. If any step fails, Batch returns that
+// step's index and the cause, and the committed volume, its free block pool
+// and its revision are exactly as before the call. A revision mismatch is
+// reported with failedStep == -1, as is a structurally invalid batch.
+func (v *Volume) Batch(steps []Step, expected int64) (newRev int64, failedStep int, err error) {
+	if len(steps) == 0 || len(steps) > MaxBatchSteps {
+		return 0, -1, ErrInvalidBatch
+	}
+	for i := range steps {
+		if err := steps[i].validateStatic(); err != nil {
+			return 0, i, err
+		}
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if expected != v.revision {
+		return v.revision, -1, ErrConflict
+	}
+	staging := v.snapshotLocked()
+	for i := range steps {
+		if err := staging.applyLocked(steps[i]); err != nil {
+			return v.revision, i, err
+		}
+	}
+	// Commit: swap the staged state in and advance the revision once.
+	v.blocks = staging.blocks
+	v.files = staging.files
+	v.freelist = staging.freelist
 	v.revision++
-	return v.revision, nil
+	return v.revision, -1, nil
 }
 
 // Read returns up to length bytes starting at offset. A negative length reads

@@ -71,6 +71,7 @@ const (
 	kRange    errKind = "range"
 	kQuota    errKind = "quota"
 	kExists   errKind = "exists"
+	kBadBatch errKind = "badbatch"
 )
 
 func (m *model) create(name string, rev int64) errKind {
@@ -80,11 +81,19 @@ func (m *model) create(name string, rev int64) errKind {
 	if rev != m.revision {
 		return kConflict
 	}
+	if k := m.createStaged(name); k != kOK {
+		return k
+	}
+	m.revision++
+	return kOK
+}
+
+// createStaged is the batch-staging variant: no revision check or bump.
+func (m *model) createStaged(name string) errKind {
 	if _, ok := m.files[name]; ok {
 		return kExists
 	}
 	m.files[name] = &modelFile{phys: map[int64]int{}}
-	m.revision++
 	return kOK
 }
 
@@ -95,6 +104,14 @@ func (m *model) clone(src, dst string, rev int64) errKind {
 	if rev != m.revision {
 		return kConflict
 	}
+	if k := m.cloneStaged(src, dst); k != kOK {
+		return k
+	}
+	m.revision++
+	return kOK
+}
+
+func (m *model) cloneStaged(src, dst string) errKind {
 	s, ok := m.files[src]
 	if !ok {
 		return kNotFound
@@ -108,7 +125,6 @@ func (m *model) clone(src, dst string, rev int64) errKind {
 		m.blocks[id].refs++
 	}
 	m.files[dst] = nf
-	m.revision++
 	return kOK
 }
 
@@ -122,30 +138,41 @@ func (m *model) write(name string, off int64, p []byte, rev int64) errKind {
 	if rev != m.revision {
 		return kConflict
 	}
+	k, mutated := m.writeStaged(name, off, p)
+	if k != kOK {
+		return k
+	}
+	if mutated {
+		m.revision++
+	}
+	return kOK
+}
+
+// writeStaged reports whether the model was mutated (zero-length writes at or
+// before EOF are no-ops).
+func (m *model) writeStaged(name string, off int64, p []byte) (errKind, bool) {
 	f, ok := m.files[name]
 	if !ok {
-		return kNotFound
+		return kNotFound, false
 	}
 	if len(p) == 0 {
 		if off > int64(len(f.data)) {
-			return kRange
+			return kRange, false
 		}
-		return kOK
+		return kOK, false
 	}
 	end := off + int64(len(p))
 	// Reservation identical to the real implementation: one block per hole or
 	// shared block touched.
 	need := 0
-	if len(p) > 0 {
-		for idx := off / BlockSize; idx <= (end-1)/BlockSize; idx++ {
-			id, present := f.phys[idx]
-			if !present || m.blocks[id].refs > 1 {
-				need++
-			}
+	for idx := off / BlockSize; idx <= (end-1)/BlockSize; idx++ {
+		id, present := f.phys[idx]
+		if !present || m.blocks[id].refs > 1 {
+			need++
 		}
 	}
 	if len(m.blocks)+need > MaxBlocks {
-		return kQuota
+		return kQuota, false
 	}
 	// Commit byte array.
 	if end > int64(len(f.data)) {
@@ -174,8 +201,7 @@ func (m *model) write(name string, off int64, p []byte, rev int64) errKind {
 		d = d[n:]
 		o += int64(n)
 	}
-	m.revision++
-	return kOK
+	return kOK, true
 }
 
 func (m *model) truncate(name string, length int64, rev int64) errKind {
@@ -188,6 +214,14 @@ func (m *model) truncate(name string, length int64, rev int64) errKind {
 	if rev != m.revision {
 		return kConflict
 	}
+	if k := m.truncateStaged(name, length); k != kOK {
+		return k
+	}
+	m.revision++
+	return kOK
+}
+
+func (m *model) truncateStaged(name string, length int64) errKind {
 	f, ok := m.files[name]
 	if !ok {
 		return kNotFound
@@ -196,7 +230,6 @@ func (m *model) truncate(name string, length int64, rev int64) errKind {
 		grown := make([]byte, length)
 		copy(grown, f.data)
 		f.data = grown
-		m.revision++
 		return kOK
 	}
 	// Shrink, same two-phase logic as the volume.
@@ -236,7 +269,6 @@ func (m *model) truncate(name string, length int64, rev int64) errKind {
 		}
 	}
 	f.data = f.data[:length]
-	m.revision++
 	return kOK
 }
 
@@ -247,6 +279,14 @@ func (m *model) del(name string, rev int64) errKind {
 	if rev != m.revision {
 		return kConflict
 	}
+	if k := m.delStaged(name); k != kOK {
+		return k
+	}
+	m.revision++
+	return kOK
+}
+
+func (m *model) delStaged(name string) errKind {
 	f, ok := m.files[name]
 	if !ok {
 		return kNotFound
@@ -255,7 +295,6 @@ func (m *model) del(name string, rev int64) errKind {
 		m.release(id)
 	}
 	delete(m.files, name)
-	m.revision++
 	return kOK
 }
 
@@ -517,23 +556,24 @@ func TestHTTPSparseAndRangeRead(t *testing.T) {
 	// Zero-byte writes are not mutations: they neither extend a file nor bump
 	// the revision. One past EOF is still a stable range error.
 	fileLen := int64(len(m.files["h"].data))
-	if nr, st := c.write("h", fileLen, nil, 1); st != http.StatusOK || nr != 1 {
+	if nr, st := c.write("h", fileLen, nil, m.revision); st != http.StatusOK || nr != m.revision {
 		t.Fatalf("zero write at EOF: status=%d rev=%d", st, nr)
 	}
-	if _, st := c.write("h", fileLen+1, nil, 1); st != http.StatusRequestedRangeNotSatisfiable {
+	if _, st := c.write("h", fileLen+1, nil, m.revision); st != http.StatusRequestedRangeNotSatisfiable {
 		t.Fatalf("zero write past EOF status=%d", st)
 	}
 
 	// Offset and length values that individually fit in int64 must not make
 	// the server panic when their sum overflows; they are 416 responses.
+	wantRev := strconv.FormatInt(m.revision, 10)
 	_, st, hrev := c.read("h", 1, int64Max)
 	if st != http.StatusRequestedRangeNotSatisfiable {
 		t.Fatalf("overflowing read status=%d", st)
 	}
-	if hrev != "1" {
-		t.Fatalf("range error X-Revision=%q, want 1", hrev)
+	if hrev != wantRev {
+		t.Fatalf("range error X-Revision=%q, want %s", hrev, wantRev)
 	}
-	if _, st, hrev := c.read("h", fileLen+1, -1); st != http.StatusRequestedRangeNotSatisfiable || hrev != "1" {
+	if _, st, hrev := c.read("h", fileLen+1, -1); st != http.StatusRequestedRangeNotSatisfiable || hrev != wantRev {
 		t.Fatalf("past EOF read status=%d X-Revision=%q", st, hrev)
 	}
 

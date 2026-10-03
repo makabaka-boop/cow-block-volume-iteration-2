@@ -12,6 +12,9 @@ import (
 // maxWriteBytes caps a single overwrite request body.
 const maxWriteBytes = 64 << 20 // 64 MiB
 
+// maxBatchBytes caps an atomic batch request body (JSON, base64 write data).
+const maxBatchBytes = maxWriteBytes + 4<<20
+
 // Server exposes a Volume over HTTP.
 type Server struct {
 	Vol *Volume
@@ -36,6 +39,7 @@ func NewServer(vol *Volume) *Server {
 //	POST /write?name=...&offset=N        body: bytes to overwrite
 //	POST /truncate?name=...&length=N
 //	POST /delete?name=...
+//	POST /batch                          body: {"revision": N, "steps": [...]}
 //	GET  /read?name=...&offset=N[&length=N]   (no length => to EOF)
 //	GET  /stat?name=...
 //	GET  /stats
@@ -46,6 +50,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/write", s.handleWrite)
 	mux.HandleFunc("/truncate", s.handleTruncate)
 	mux.HandleFunc("/delete", s.handleDelete)
+	mux.HandleFunc("/batch", s.handleBatch)
 	mux.HandleFunc("/read", s.handleRead)
 	mux.HandleFunc("/stat", s.handleStat)
 	mux.HandleFunc("/stats", s.handleStats)
@@ -58,6 +63,14 @@ type mutationResponse struct {
 
 type errorResponse struct {
 	Error string `json:"error"`
+}
+
+// batchErrorResponse additionally reports which step failed; -1 means the
+// batch itself was rejected (invalid shape or revision conflict) before any
+// step ran.
+type batchErrorResponse struct {
+	Error string `json:"error"`
+	Step  int    `json:"step"`
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -85,6 +98,8 @@ func statusFor(err error) int {
 		return http.StatusRequestedRangeNotSatisfiable
 	case errors.Is(err, ErrQuota):
 		return http.StatusInsufficientStorage
+	case errors.Is(err, ErrInvalidBatch):
+		return http.StatusBadRequest
 	default:
 		return http.StatusInternalServerError
 	}
@@ -228,6 +243,62 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	newRev, err := s.Vol.Delete(r.URL.Query().Get("name"), rev)
 	if err != nil {
 		writeError(w, statusFor(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, mutationResponse{Revision: newRev})
+}
+
+// batchRequest is the body of POST /batch. The expected revision may also be
+// supplied via rev= or X-Expected-Revision, which take precedence over the
+// body field, matching the single-step endpoints.
+type batchRequest struct {
+	Revision *int64 `json:"revision"`
+	Steps    []Step `json:"steps"`
+}
+
+// batchRevision resolves the single expected revision for a batch: query
+// parameter or header first, then the request body.
+func batchRevision(r *http.Request, req *batchRequest) (int64, error) {
+	raw := r.URL.Query().Get("rev")
+	if h := r.Header.Get("X-Expected-Revision"); h != "" {
+		raw = h
+	}
+	if raw != "" {
+		n, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || n < 0 {
+			return 0, errors.New("invalid expected revision")
+		}
+		return n, nil
+	}
+	if req.Revision == nil || *req.Revision < 0 {
+		return 0, errors.New("missing expected revision (rev, X-Expected-Revision or body revision)")
+	}
+	return *req.Revision, nil
+}
+
+func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBatchBytes)
+	var req batchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if strings.Contains(err.Error(), "request body too large") {
+			writeError(w, http.StatusRequestEntityTooLarge, err)
+			return
+		}
+		writeError(w, http.StatusBadRequest, errors.New("invalid batch body: "+err.Error()))
+		return
+	}
+	rev, err := batchRevision(r, &req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	newRev, step, err := s.Vol.Batch(req.Steps, rev)
+	if err != nil {
+		writeJSON(w, statusFor(err), batchErrorResponse{Error: err.Error(), Step: step})
 		return
 	}
 	writeJSON(w, http.StatusOK, mutationResponse{Revision: newRev})
